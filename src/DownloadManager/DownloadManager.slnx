@@ -1,6 +1,6 @@
 <Solution>
-  <Project Path="Client/Client.csproj" />
-  <Project Path="Contracts/Contracts.csproj" />
-  <Project Path="Host/Host.csproj" />
-  <Project Path="Service/Service.csproj" />
+  <Project Path="Client/Client.csproj" Id="b3c44e93-b194-43d6-9340-66128c028880" />
+  <Project Path="Contracts/Contracts.csproj" Id="219a7d57-18a9-4e4f-997a-50685d6dbe64" />
+  <Project Path="Host/Host.csproj" Id="5500e385-3228-4505-86f5-14646bfcf4e8" />
+  <Project Path="Service/Service.csproj" Id="7983642a-ce41-4b18-abc9-23985ed588c1" />
 </Solution>

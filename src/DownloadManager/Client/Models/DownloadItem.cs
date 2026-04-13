@@ -5,5 +5,9 @@ namespace Client.Models
 {
   public class DownloadItem
   {
+    public string FileName { get; set; }
+    public string Domain { get; set; }
+    public int Progress { get; set; }
+    public string Status { get; set; }
   }
 }
