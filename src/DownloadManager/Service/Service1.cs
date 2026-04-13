@@ -6,7 +6,7 @@ using System;
 namespace Service
 {
   // ПРИМЕЧАНИЕ. Команду "Переименовать" в меню "Рефакторинг" можно использовать для одновременного изменения имени класса "Service1" в коде и файле конфигурации.
-  public class Service1 : IService1
+  public class Service1 : IService
   {
     public string GetData(int value)
     {

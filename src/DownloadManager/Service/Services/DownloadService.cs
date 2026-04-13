@@ -1,9 +1,9 @@
 // Created by Anton Piruev in 2026. 
 // Any direct commercial use of derivative work is strictly prohibited.
 
-namespace Contracts
+namespace Service.Services
 {
-  public class Class1
+  public class DownloadService
   {
   }
 }

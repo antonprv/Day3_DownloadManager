@@ -5,7 +5,7 @@ using System.ServiceProcess;
 
 namespace Host
 {
-  internal static class Program
+  public static class Program
   {
     /// <summary>
     /// Главная точка входа для приложения.
