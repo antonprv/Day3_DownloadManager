@@ -8,11 +8,16 @@ using System.Drawing.Drawing2D;
 using System.Windows.Forms;
 
 using Client.Models;
+using Client.Services;
 
 namespace Client
 {
   public partial class MainForm : Form
   {
+    private readonly HttpDownloadService _downloadService = new HttpDownloadService();
+    private readonly WcfClientService _wcfClient = new WcfClientService();
+    private readonly List<DownloadItem> _downloads = new List<DownloadItem>();
+
     private const int AnimationIntervalMs = 16;
     private const float AnimationLerpFactor = 0.15f;
     private const int CornerRadiusProgress = 6;
@@ -28,7 +33,7 @@ namespace Client
     private static readonly Color ColorTextPrimary = Color.FromArgb(235, 235, 245);
     private static readonly Color ColorTextSecondary = Color.FromArgb(142, 142, 147);
 
-    private Timer _animationTimer;
+    private System.Windows.Forms.Timer _animationTimer;
     private readonly Dictionary<DataGridViewRow, float> _animatedProgress = new Dictionary<DataGridViewRow, float>();
     private readonly Dictionary<string, Image> _fileIconCache = new Dictionary<string, Image>();
     private readonly Dictionary<string, Image> _faviconCache = new Dictionary<string, Image>();
@@ -40,11 +45,12 @@ namespace Client
       InitializeComponent();
 
       dgvQueue.CellPainting += DgvQueue_CellPainting;
-
+     
       StartProgressAnimation();
       SubscribeHoverEvents();
 
-      SetWcfConnectionStatus(connected: true);
+      TryConnectToWcf();
+      RefreshHistory();
     }
 
     #region Hover tracking
@@ -67,7 +73,7 @@ namespace Client
 
     private void StartProgressAnimation()
     {
-      _animationTimer = new Timer { Interval = AnimationIntervalMs };
+      _animationTimer = new System.Windows.Forms.Timer { Interval = AnimationIntervalMs };
       _animationTimer.Tick += OnAnimationTick;
       _animationTimer.Start();
     }
@@ -121,7 +127,7 @@ namespace Client
       {
         using (var httpClient = new System.Net.Http.HttpClient())
         {
-          string url = $"https://www.google.com/s2/favicons?domain={domain}&sz=32";
+          string url = string.Format("https://www.google.com/s2/favicons?domain={0}&sz=32", domain);
           var stream = await httpClient.GetStreamAsync(url);
 
           _faviconCache[domain] = Image.FromStream(stream);
@@ -209,12 +215,19 @@ namespace Client
       if (item == null)
         return cursorX;
 
-      Image icon = GetFileIcon(item.FileName);
-      if (icon == null)
-        return cursorX;
+      try
+      {
+        Image icon = GetFileIcon(item.FileName);
+        if (icon == null)
+          return cursorX;
 
-      g.DrawImage(icon, cursorX, bounds.Y + 6, 20, 20);
-      return cursorX + 26;
+        g.DrawImage(icon, cursorX, bounds.Y + 6, 20, 20);
+        return cursorX + 26;
+      }
+      catch
+      {
+        return cursorX;
+      }
     }
 
     private int TryDrawFavicon(Graphics g, DataGridViewRow row, Rectangle bounds, int cursorX)
@@ -314,7 +327,7 @@ namespace Client
           LineAlignment = StringAlignment.Center
         };
 
-        g.DrawString($"{(int)percent}%", font, brush, (RectangleF)bounds, sf);
+        g.DrawString(string.Format("{0}%", (int)percent), font, brush, (RectangleF)bounds, sf);
       }
     }
 
@@ -344,6 +357,7 @@ namespace Client
         case "Downloading": return ColorAccentBlue;
         case "Complete": return ColorAccentGreen;
         case "Failed": return ColorAccentRed;
+        case "Cancelled": return ColorAccentGray;
         default: return ColorAccentGray;
       }
     }
@@ -391,6 +405,254 @@ namespace Client
     {
       tsslWcfStatus.ForeColor = connected ? ColorAccentGreen : ColorAccentRed;
       tsslWcfStatus.Text = connected ? "connected" : "disconnected";
+    }
+
+    #endregion
+
+    #region Button handlers
+
+    private async void BtnAddUrl_ClickAsync(object sender, EventArgs e)
+    {
+      string url = txtUrl.Text.Trim();
+
+      if (string.IsNullOrEmpty(url) || url == "https://")
+        return;
+
+      Uri uri = new Uri(url);
+      string fileName = System.IO.Path.GetFileName(uri.AbsolutePath.TrimEnd('/'));
+      if (string.IsNullOrEmpty(fileName))
+        fileName = uri.Host + "_file";
+
+      string destPath = System.IO.Path.Combine(
+          Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+          "Downloads", fileName);
+
+      var item = new DownloadItem
+      {
+        FileName = fileName,
+        Domain = uri.Host,
+        Url = url,
+        Progress = 0,
+        Status = "Downloading"
+      };
+
+      AddRowToQueue(item);
+      UpdateStats();
+      txtUrl.Text = "https://";
+
+      var progress = new Progress<int>(percent =>
+      {
+        item.Progress = percent;
+        UpdateQueueRow(item);
+      });
+
+      try
+      {
+        long fileSize = await _downloadService.DownloadAsync(
+            url, destPath, progress, item.CancellationSource.Token);
+
+        item.Status = "Complete";
+        item.Progress = 100;
+
+        TryLogDownload(new Contracts.Dto.DownloadRecordDto
+        {
+          Url = url,
+          FileName = fileName,
+          FileSizeBytes = fileSize,
+          DownloadedAt = DateTime.Now,
+          Success = true
+        });
+      }
+      catch (OperationCanceledException)
+      {
+        item.Status = "Cancelled";
+        item.Progress = 0;
+      }
+      catch
+      {
+        item.Status = "Failed";
+
+        TryLogDownload(new Contracts.Dto.DownloadRecordDto
+        {
+          Url = url,
+          FileName = fileName,
+          FileSizeBytes = 0,
+          DownloadedAt = DateTime.Now,
+          Success = false
+        });
+      }
+
+      UpdateQueueRow(item);
+      UpdateStats();
+      RefreshHistory();
+    }
+
+    private void BtnClearDone_Click(object sender, EventArgs e)
+    {
+      var rowsToRemove = new List<DataGridViewRow>();
+
+      foreach (DataGridViewRow row in dgvQueue.Rows)
+      {
+        var item = row.Tag as DownloadItem;
+        if (item != null && (item.Status == "Complete" ||
+                             item.Status == "Failed" ||
+                             item.Status == "Cancelled"))
+          rowsToRemove.Add(row);
+      }
+
+      foreach (var row in rowsToRemove)
+      {
+        _animatedProgress.Remove(row);
+        dgvQueue.Rows.Remove(row);
+      }
+
+      UpdateStats();
+    }
+
+    private void BtnCancelAll_Click(object sender, EventArgs e)
+    {
+      foreach (DataGridViewRow row in dgvQueue.Rows)
+      {
+        var item = row.Tag as DownloadItem;
+        if (item != null && item.Status == "Downloading")
+          item.CancellationSource.Cancel();
+      }
+    }
+
+    #endregion
+
+    #region Queue right-click context menu
+
+    private void DgvHistory_CellMouseRightClick(object sender, DataGridViewCellMouseEventArgs e)
+    {
+      if (e.Button != MouseButtons.Right || e.RowIndex < 0)
+        return;
+
+      var item = dgvQueue.Rows[e.RowIndex].Tag as DownloadItem;
+      if (item == null || item.Status != "Downloading")
+        return;
+
+      var menu = new ContextMenuStrip();
+      var cancelItem = new ToolStripMenuItem("Cancel download");
+
+      cancelItem.Click += (s, args) => item.CancellationSource.Cancel();
+      menu.Items.Add(cancelItem);
+      menu.Show(dgvQueue, dgvQueue.PointToClient(Cursor.Position));
+    }
+
+    #endregion
+
+    #region Queue row helpers
+
+    private void AddRowToQueue(DownloadItem item)
+    {
+      var row = new DataGridViewRow();
+      row.Tag = item;
+      row.CreateCells(dgvQueue, item.FileName, "", item.Progress, item.Status);
+      dgvQueue.Rows.Add(row);
+    }
+
+    private void UpdateQueueRow(DownloadItem item)
+    {
+      foreach (DataGridViewRow row in dgvQueue.Rows)
+      {
+        if (row.Tag != item)
+          continue;
+
+        row.Cells["colQProgress"].Value = item.Progress;
+        row.Cells["colQStatus"].Value = item.Status;
+        break;
+      }
+    }
+
+    #endregion
+
+    #region Stats and status bar
+
+    private void UpdateStats()
+    {
+      int completed = 0;
+      int downloading = 0;
+      int queued = 0;
+      int failed = 0;
+
+      foreach (DataGridViewRow row in dgvQueue.Rows)
+      {
+        var item = row.Tag as DownloadItem;
+        if (item == null) continue;
+
+        switch (item.Status)
+        {
+          case "Complete": completed++; break;
+          case "Downloading": downloading++; break;
+          case "Queued": queued++; break;
+          case "Failed": failed++; break;
+        }
+      }
+
+      lblCompletedNum.Text = completed.ToString();
+      lblDownloadingNum.Text = downloading.ToString();
+      lblQueuedNum.Text = queued.ToString();
+      lblFailedNum.Text = failed.ToString();
+
+      tsslActive.Text = string.Format("{0} active", downloading);
+    }
+
+    private void TryConnectToWcf()
+    {
+      try
+      {
+        _wcfClient.GetHistory();
+        SetWcfConnectionStatus(connected: true);
+      }
+      catch
+      {
+        SetWcfConnectionStatus(connected: false);
+      }
+    }
+
+    private void TryLogDownload(Contracts.Dto.DownloadRecordDto record)
+    {
+      try
+      {
+        _wcfClient.LogDownload(record);
+        SetWcfConnectionStatus(connected: true);
+      }
+      catch
+      {
+        SetWcfConnectionStatus(connected: false);
+      }
+    }
+
+    private void RefreshHistory()
+    {
+      try
+      {
+        var history = _wcfClient.GetHistory();
+        dgvHistory.Rows.Clear();
+
+        foreach (var record in history)
+        {
+          dgvHistory.Rows.Add(
+              record.FileName,
+              FormatFileSize(record.FileSizeBytes),
+              record.Success ? "Complete" : "Failed"
+          );
+        }
+
+        SetWcfConnectionStatus(connected: true);
+      }
+      catch
+      {
+        SetWcfConnectionStatus(connected: false);
+      }
+    }
+
+    private string FormatFileSize(long bytes)
+    {
+      if (bytes < 1024) return bytes + " B";
+      if (bytes < 1024 * 1024) return (bytes / 1024) + " KB";
+      return (bytes / (1024 * 1024)) + " MB";
     }
 
     #endregion
