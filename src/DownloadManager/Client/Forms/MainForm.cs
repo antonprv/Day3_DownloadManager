@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Security.Policy;
 using System.Windows.Forms;
 
 using Client.Models;
@@ -16,7 +17,6 @@ namespace Client
   {
     private readonly HttpDownloadService _downloadService = new HttpDownloadService();
     private readonly WcfClientService _wcfClient = new WcfClientService();
-    private readonly List<DownloadItem> _downloads = new List<DownloadItem>();
 
     private const int AnimationIntervalMs = 16;
     private const float AnimationLerpFactor = 0.15f;
@@ -31,9 +31,8 @@ namespace Client
     private static readonly Color ColorAccentRed = Color.FromArgb(255, 69, 58);
     private static readonly Color ColorAccentGray = Color.FromArgb(142, 142, 147);
     private static readonly Color ColorTextPrimary = Color.FromArgb(235, 235, 245);
-    private static readonly Color ColorTextSecondary = Color.FromArgb(142, 142, 147);
 
-    private System.Windows.Forms.Timer _animationTimer;
+    private Timer _animationTimer;
     private readonly Dictionary<DataGridViewRow, float> _animatedProgress = new Dictionary<DataGridViewRow, float>();
     private readonly Dictionary<string, Image> _fileIconCache = new Dictionary<string, Image>();
     private readonly Dictionary<string, Image> _faviconCache = new Dictionary<string, Image>();
@@ -44,13 +43,25 @@ namespace Client
     {
       InitializeComponent();
 
+      SetDoubleBuffered(dgvQueue);
+      SetDoubleBuffered(dgvHistory);
+
       dgvQueue.CellPainting += DgvQueue_CellPainting;
-     
+
       StartProgressAnimation();
       SubscribeHoverEvents();
 
       TryConnectToWcf();
       RefreshHistory();
+    }
+
+    private static void SetDoubleBuffered(DataGridView dgv)
+    {
+      typeof(DataGridView)
+          .GetProperty("DoubleBuffered",
+              System.Reflection.BindingFlags.Instance |
+              System.Reflection.BindingFlags.NonPublic)
+          ?.SetValue(dgv, true, null);
     }
 
     #region Hover tracking
@@ -63,8 +74,15 @@ namespace Client
 
     private void SetHoveredRow(int rowIndex)
     {
+      if (_hoveredRowIndex == rowIndex) return;
+
+      int prev = _hoveredRowIndex;
       _hoveredRowIndex = rowIndex;
-      dgvQueue.Invalidate();
+
+      if (prev >= 0 && prev < dgvQueue.Rows.Count)
+        dgvQueue.InvalidateRow(prev);
+      if (rowIndex >= 0 && rowIndex < dgvQueue.Rows.Count)
+        dgvQueue.InvalidateRow(rowIndex);
     }
 
     #endregion
@@ -111,30 +129,16 @@ namespace Client
       if (_fileIconCache.ContainsKey(extension))
         return _fileIconCache[extension];
 
-      Icon icon = Icon.ExtractAssociatedIcon(filePath);
-      Image bitmap = icon != null ? icon.ToBitmap() : null;
-      _fileIconCache[extension] = bitmap;
-
-      return bitmap;
-    }
-
-    private async void LoadFaviconAsync(string domain)
-    {
-      if (_faviconCache.ContainsKey(domain))
-        return;
-
+      Image bitmap = null;
       try
       {
-        using (var httpClient = new System.Net.Http.HttpClient())
-        {
-          string url = string.Format("https://www.google.com/s2/favicons?domain={0}&sz=32", domain);
-          var stream = await httpClient.GetStreamAsync(url);
-
-          _faviconCache[domain] = Image.FromStream(stream);
-          dgvQueue.Invalidate();
-        }
+        Icon icon = Icon.ExtractAssociatedIcon(filePath);
+        bitmap = icon?.ToBitmap();
       }
       catch { }
+
+      _fileIconCache[extension] = bitmap; // пишем даже null
+      return bitmap;
     }
 
     #endregion
@@ -212,58 +216,83 @@ namespace Client
     private int TryDrawFileIcon(Graphics g, DataGridViewRow row, Rectangle bounds, int cursorX)
     {
       var item = row.Tag as DownloadItem;
-      if (item == null)
-        return cursorX;
+      if (item == null) return cursorX;
 
       try
       {
         Image icon = GetFileIcon(item.FileName);
-        if (icon == null)
-          return cursorX;
+        if (icon == null) return cursorX;
 
-        g.DrawImage(icon, cursorX, bounds.Y + 6, 20, 20);
-        return cursorX + 26;
+        int iconSize = 20;
+        int iconY = bounds.Y + (bounds.Height - iconSize) / 2;
+        g.DrawImage(icon, cursorX, iconY, iconSize, iconSize);
+        return cursorX + iconSize + 6;
       }
-      catch
-      {
-        return cursorX;
-      }
+      catch { return cursorX; }
     }
 
     private int TryDrawFavicon(Graphics g, DataGridViewRow row, Rectangle bounds, int cursorX)
     {
       var item = row.Tag as DownloadItem;
-      if (item == null)
-        return cursorX;
+      if (item == null) return cursorX;
 
       if (!_faviconCache.ContainsKey(item.Domain))
         LoadFaviconAsync(item.Domain);
 
       Image favicon;
-      if (!_faviconCache.TryGetValue(item.Domain, out favicon))
+      if (!_faviconCache.TryGetValue(item.Domain, out favicon) || favicon == null)
         return cursorX;
 
-      g.DrawImage(favicon, cursorX, bounds.Y + bounds.Height / 2, 16, 16);
-      return cursorX + 20;
+      int iconSize = 16;
+      int iconY = bounds.Y + (bounds.Height - iconSize) / 2;
+      g.DrawImage(favicon, cursorX, iconY, iconSize, iconSize);
+      return cursorX + iconSize + 4;
     }
 
+    private async void LoadFaviconAsync(string domain)
+    {
+      if (_faviconCache.ContainsKey(domain))
+        return;
+
+      _faviconCache[domain] = null;
+
+      try
+      {
+        using (var httpClient = new System.Net.Http.HttpClient())
+        {
+          string url = string.Format("https://www.google.com/s2/favicons?domain={0}&sz=32", domain);
+
+          byte[] bytes = await httpClient.GetByteArrayAsync(url);
+
+          _faviconCache[domain] = Image.FromStream(new System.IO.MemoryStream(bytes));
+
+          if (!dgvQueue.IsDisposed)
+            dgvQueue.InvalidateColumn(dgvQueue.Columns["colQFile"].Index);
+        }
+      }
+      catch { }
+    }
     private void DrawFileCellText(Graphics g, DataGridViewRow row, Rectangle bounds, int cursorX, string fileName)
     {
       var item = row.Tag as DownloadItem;
       string domain = item != null ? item.Domain : "example.com";
+      domain += $": {fileName}";
 
-      float textAreaWidth = bounds.Width - (cursorX - bounds.X);
-      var topHalf = new RectangleF(cursorX, bounds.Y, textAreaWidth, bounds.Height / 2f);
-      var bottomHalf = new RectangleF(cursorX, bounds.Y + bounds.Height / 2f, textAreaWidth, bounds.Height / 2f);
+      float textAreaWidth = bounds.Right - cursorX;
 
-      using (var fontPrimary = new Font("Segoe UI", 9.5f))
-      using (var fontSecondary = new Font("Segoe UI", 8f))
-      using (var brushPrimary = new SolidBrush(ColorTextPrimary))
-      using (var brushSecondary = new SolidBrush(ColorTextSecondary))
+      var sf = new StringFormat
       {
-        g.DrawString(fileName, fontPrimary, brushPrimary, topHalf);
-        g.DrawString(domain, fontSecondary, brushSecondary, bottomHalf);
-      }
+        Alignment = StringAlignment.Near,
+        LineAlignment = StringAlignment.Center,
+        Trimming = StringTrimming.EllipsisCharacter,
+        FormatFlags = StringFormatFlags.NoWrap
+      };
+
+      var rect = new RectangleF(cursorX, bounds.Y, textAreaWidth, bounds.Height);
+
+      using (var font = new Font("Segoe UI", 9.5f))
+      using (var brush = new SolidBrush(ColorTextPrimary))
+      { g.DrawString(domain, font, brush, rect, sf); }
     }
 
     #endregion
@@ -418,73 +447,86 @@ namespace Client
       if (string.IsNullOrEmpty(url) || url == "https://")
         return;
 
-      Uri uri = new Uri(url);
-      string fileName = System.IO.Path.GetFileName(uri.AbsolutePath.TrimEnd('/'));
-      if (string.IsNullOrEmpty(fileName))
-        fileName = uri.Host + "_file";
-
-      string destPath = System.IO.Path.Combine(
-          Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-          "Downloads", fileName);
-
-      var item = new DownloadItem
-      {
-        FileName = fileName,
-        Domain = uri.Host,
-        Url = url,
-        Progress = 0,
-        Status = "Downloading"
-      };
-
-      AddRowToQueue(item);
-      UpdateStats();
-      txtUrl.Text = "https://";
-
-      var progress = new Progress<int>(percent =>
-      {
-        item.Progress = percent;
-        UpdateQueueRow(item);
-      });
-
       try
       {
-        long fileSize = await _downloadService.DownloadAsync(
-            url, destPath, progress, item.CancellationSource.Token);
+        Uri uri = new Uri(url);
 
-        item.Status = "Complete";
-        item.Progress = 100;
+        string fileName = System.IO.Path.GetFileName(uri.AbsolutePath.TrimEnd('/'));
+        if (string.IsNullOrEmpty(fileName))
+          fileName = uri.Host + "_file";
 
-        TryLogDownload(new Contracts.Dto.DownloadRecordDto
+        string destPath = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads", fileName);
+
+        var item = new DownloadItem
         {
-          Url = url,
           FileName = fileName,
-          FileSizeBytes = fileSize,
-          DownloadedAt = DateTime.Now,
-          Success = true
-        });
-      }
-      catch (OperationCanceledException)
-      {
-        item.Status = "Cancelled";
-        item.Progress = 0;
-      }
-      catch
-      {
-        item.Status = "Failed";
+          Domain = uri.Host,
+          Url = url,
+          Progress = 0,
+          Status = "Downloading"
+        };
 
-        TryLogDownload(new Contracts.Dto.DownloadRecordDto
+        AddRowToQueue(item);
+        UpdateStats();
+        txtUrl.Text = "https://";
+
+        var progress = new Progress<int>(percent =>
         {
-          Url = url,
-          FileName = fileName,
-          FileSizeBytes = 0,
-          DownloadedAt = DateTime.Now,
-          Success = false
+          item.Progress = percent;
+          UpdateQueueRow(item);
         });
-      }
 
-      UpdateQueueRow(item);
-      UpdateStats();
-      RefreshHistory();
+        try
+        {
+          long fileSize = await _downloadService.DownloadAsync(
+              url, destPath, progress, item.CancellationSource.Token);
+
+          item.Status = "Complete";
+          item.Progress = 100;
+
+          UpdateQueueRowSize(item, fileSize);
+
+          TryLogDownload(new Contracts.Dto.DownloadRecordDto
+          {
+            Url = url,
+            FileName = fileName,
+            FileSizeBytes = fileSize,
+            DownloadedAt = DateTime.Now,
+            Success = true
+          });
+        }
+        catch (OperationCanceledException)
+        {
+          item.Status = "Cancelled";
+          item.Progress = 0;
+        }
+        catch
+        {
+          item.Status = "Failed";
+
+          TryLogDownload(new Contracts.Dto.DownloadRecordDto
+          {
+            Url = url,
+            FileName = fileName,
+            FileSizeBytes = 0,
+            DownloadedAt = DateTime.Now,
+            Success = false
+          });
+        }
+
+        UpdateQueueRow(item);
+        UpdateStats();
+        RefreshHistory();
+      }
+      catch (Exception exception)
+      {
+        var dialog = MessageBox.Show(exception.Message, "Error");
+
+        if (dialog == DialogResult.OK || dialog == DialogResult.Cancel)
+          return;
+      }
     }
 
     private void BtnClearDone_Click(object sender, EventArgs e)
@@ -550,6 +592,16 @@ namespace Client
       row.Tag = item;
       row.CreateCells(dgvQueue, item.FileName, "", item.Progress, item.Status);
       dgvQueue.Rows.Add(row);
+    }
+
+    private void UpdateQueueRowSize(DownloadItem item, long bytes)
+    {
+      foreach (DataGridViewRow row in dgvQueue.Rows)
+      {
+        if (row.Tag != item) continue;
+        row.Cells["colQSize"].Value = FormatFileSize(bytes);
+        break;
+      }
     }
 
     private void UpdateQueueRow(DownloadItem item)

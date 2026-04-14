@@ -12,6 +12,8 @@ namespace Client.Services
   {
     private static readonly HttpClient _httpClient = new HttpClient();
 
+    private static readonly int _bufferSize = 81920; // 80 KB chunks
+
     public async Task<long> DownloadAsync(
         string url,
         string destinationPath,
@@ -28,7 +30,7 @@ namespace Client.Services
         using (var contentStream = await response.Content.ReadAsStreamAsync())
         using (var fileStream = new System.IO.FileStream(destinationPath, System.IO.FileMode.Create))
         {
-          var buffer = new byte[81920]; // 80 KB chunks
+          var buffer = new byte[_bufferSize]; 
           int bytesRead;
 
           while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
